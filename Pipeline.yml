@@ -1,0 +1,319 @@
+---
+    AWSTemplateFormatVersion: '2010-09-09'
+    Description: Continuous delivery pipeline of a simple 
+    Parameters:
+      RepositoryName:
+        Type: String
+        Description: CodeCommit Repo to pull from. Only the Name. not the URL
+        Default: "sample-pipeline"
+      BranchName:
+        Type: String
+        Description: CodeCommit Branch
+        Default: "master"
+      ECSCluster: 
+        Type: String
+        Description: ECSCluster Name
+        Default: "webapp"
+      ECSServiceName:
+        Type: String
+        Description: ECSServiceName Provider
+        Default: "webapp-service" 
+    Metadata:
+      AWS::CloudFormation::Interface:
+        ParameterGroups:
+          - Label:
+              default: "CodeCommit Configuration"
+            Parameters:
+              - RepositoryName
+              - BranchName
+              - ECSCluster
+              - ECSServiceName
+        ParameterLabels:
+          RepositoryName: 
+            default: CodeCommit Repository Name
+          BranchName: 
+            default: CodeCommit Branch Name
+          ECSCluster:
+            default: Cluster Name
+          ECSServiceName:
+            default: Farget service Name 
+    Resources:
+      CodeBuildPackage:
+        Type: AWS::CodeBuild::Project
+        DependsOn: CodeBuildRole
+        Properties:
+          Name: !Sub ${AWS::StackName}-package
+          Description: Package application for deployment
+          ServiceRole: !GetAtt CodeBuildRole.Arn
+          Artifacts:
+            Type: CODEPIPELINE
+          Environment:
+            Type: linuxContainer
+            ComputeType: BUILD_GENERAL1_SMALL
+            Image: aws/codebuild/standard:3.0
+            PrivilegedMode: true
+            EnvironmentVariables:
+              - Name: S3_BUCKET
+                Value: !Ref PipelineBucket
+          Source:
+            Type: CODEPIPELINE
+            BuildSpec: buildspec.yml
+          TimeoutInMinutes: 10
+          Tags:
+            - Key: Name
+              Value: !Sub ${AWS::StackName}
+      PipelineBucket:
+        Type: AWS::S3::Bucket
+      AmazonCloudWatchEventRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service:
+                    - events.amazonaws.com
+                Action: 'sts:AssumeRole'
+          Path: /
+          Policies:
+            - PolicyName: cwe-pipeline-execution
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Action: 'codepipeline:StartPipelineExecution'
+                    Resource: !Join 
+                      - ''
+                      - - 'arn:aws:codepipeline:'
+                        - !Ref 'AWS::Region'
+                        - ':'
+                        - !Ref 'AWS::AccountId'
+                        - ':'
+                        - !Ref Pipeline
+      AmazonCloudWatchEventRule:
+        Type: 'AWS::Events::Rule'
+        Properties:
+          EventPattern:
+            source:
+              - aws.codecommit
+            detail-type:
+              - CodeCommit Repository State Change
+            resources:
+              - !Join 
+                - ''
+                - - 'arn:aws:codecommit:'
+                  - !Ref 'AWS::Region'
+                  - ':'
+                  - !Ref 'AWS::AccountId'
+                  - ':'
+                  - !Ref RepositoryName
+            detail:
+              event:
+                - referenceCreated
+                - referenceUpdated
+              referenceType:
+                - branch
+              referenceName:
+                - master
+          Targets:
+            - Arn: !Join 
+                - ''
+                - - 'arn:aws:codepipeline:'
+                  - !Ref 'AWS::Region'
+                  - ':'
+                  - !Ref 'AWS::AccountId'
+                  - ':'
+                  - !Ref Pipeline
+              RoleArn: !GetAtt 
+                - AmazonCloudWatchEventRole
+                - Arn
+              Id: codepipeline-Pipeline
+      Pipeline:
+        Type: AWS::CodePipeline::Pipeline
+        Properties:
+          Name: !Sub ${AWS::StackName}
+          RoleArn: !GetAtt CodePipelineRole.Arn
+          Stages:
+          - Name: Source
+            Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              OutputArtifacts:
+              - Name: SourceOutput
+              Configuration:
+                BranchName: !Ref BranchName
+                RepositoryName: !Ref RepositoryName
+                PollForSourceChanges: false
+              RunOrder: 1
+          - Name: Build
+            Actions:
+            - Name: Package
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              InputArtifacts:
+              - Name: SourceOutput
+              OutputArtifacts:
+              - Name: PackageOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildPackage
+              RunOrder: 1
+          - Name: Deploy
+            Actions:
+            - Name: ecs
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: ECS
+              InputArtifacts:
+              - Name: PackageOutput
+              Configuration:
+                ClusterName: !Ref ECSCluster
+                ServiceName: !Ref ECSServiceName
+                FileName: imagedefinitions.json
+                DeploymentTimeout: '15'
+              RunOrder: 2
+          ArtifactStore:
+            Type: S3
+            Location: !Ref PipelineBucket
+      CodeBuildRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                - codebuild.amazonaws.com
+              Action:
+              - sts:AssumeRole
+          Path: "/"
+          
+          Policies:
+          - PolicyName: codepipeline-integration
+            PolicyDocument:
+              Statement:
+              - Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:GetObjectVersion
+                Resource: 
+                - !Sub arn:aws:s3:::${PipelineBucket}/*
+                Effect: Allow
+              - Action:
+                - 'codecommit:CancelUploadArchive'
+                - 'codecommit:GetBranch'
+                - 'codecommit:GetCommit'
+                - 'codecommit:GetUploadArchiveStatus'
+                - 'codecommit:UploadArchive'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                - s3:ListBucket
+                - s3:ListBucketMultipartUploads
+                - s3:GetBucketVersioning
+                Resource: 
+                - !Sub arn:aws:s3:::${PipelineBucket}
+                Effect: Allow
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource:
+                - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*
+                - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*:*
+                Effect: Allow
+              - Action:
+                - codepipeline:GetPipelineState
+                Effect: Allow
+                Resource:
+                - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+              - Action:
+                - codepipeline:GetJobDetails
+                - codepipeline:PollForJobs
+                Effect: Allow
+                Resource:
+                - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+              - Action:
+                - codepipeline:AcknowledgeJob
+                - codepipeline:PutJobFailureResult
+                - codepipeline:PutJobSuccessResult
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - ecr:*
+                Effect: Allow
+                Resource: '*'
+      CodePipelineRole:
+        Type: AWS::IAM::Role
+        Properties:
+          AssumeRolePolicyDocument:
+            Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                - codepipeline.amazonaws.com
+              Action:
+              - sts:AssumeRole
+          Path: "/"
+          Policies:
+          - PolicyName: codepipeline-service
+            PolicyDocument:
+              Statement:
+              - Action:
+                - codebuild:StartBuild
+                - codebuild:StopBuild
+                - codebuild:BatchGetProjects
+                - codebuild:BatchGetBuilds
+                Resource: 
+                - !GetAtt CodeBuildPackage.Arn
+                Effect: Allow
+              - Action:
+                - 'codecommit:CancelUploadArchive'
+                - 'codecommit:GetBranch'
+                - 'codecommit:GetCommit'
+                - 'codecommit:GetUploadArchiveStatus'
+                - 'codecommit:UploadArchive'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                - 'ecs:*'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                - 'codedeploy:*'
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:GetObjectVersion
+                Resource: 
+                - !Sub arn:aws:s3:::${PipelineBucket}/*
+                Effect: Allow
+              - Action:
+                - s3:ListBucket
+                - s3:ListBucketMultipartUploads
+                - s3:GetBucketVersioning
+                Resource: 
+                - !Sub arn:aws:s3:::${PipelineBucket}
+                Effect: Allow
+              - Action:
+                - iam:PassRole
+                Resource: '*'
+                Effect: Allow
+              Version: '2012-10-17'
+    Outputs:
+      CodePipelineUrl:
+        Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+        Description: CodePipeline URL
+    

@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Internal, private load balancer that only accepts traffic from 
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+      - ParentClientStack
+      - ParentAlertStack
+      - EnvironmentName
+      - Ports
+      - Timeout
+   
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: The name of the environment to add this load balancer to
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on ALB_NAT_vpc_cloudformation_template.yml template.'
+    Type: String
+  ParentAlertStack:
+    Description: 'Optional but recommended stack name of parent alert stack based on alert.yaml template.'
+    Type: String
+    Default: ''
+  ParentClientStack:
+    Description: 'Stack name of parent client stack based on client-sg.yaml template.'
+    Type: String
+  Ports:
+    Default: '80'
+    Description: Conatiner Target Port
+    Type: Number
+    MinValue: '1'
+    MaxValue: '65000'
+  Timeout:
+    Default: '30'
+    Description: Idle Timeout
+    Type: Number
+    MinValue: '30'
+    MaxValue: '10000'
+Resources:
+  EcsSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: {'Fn::ImportValue': !Sub '${ParentClientStack}-ClientSecurityGroup'}
+      IpProtocol: tcp
+      FromPort: !Ref Ports
+      ToPort: !Ref Ports
+      CidrIp: {'Fn::ImportValue': !Sub '${ParentVPCStack}-CidrBlock'}
+
+  # Public load balancer, hosted in public subnets that is accessible
+  # to the public, and is intended to route traffic to one or more public
+  # facing services. This is used for accepting traffic from the public
+  # internet and directing it to public facing microservices
+  PrivateLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Private facing load balancer
+      VpcId:
+        Fn::ImportValue: !Sub ${ParentVPCStack}-VPC
+      SecurityGroupIngress:
+          # Allow access to ALB from Private on the VPC
+          - CidrIp: {'Fn::ImportValue': !Sub '${ParentVPCStack}-CidrBlock'}
+            IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+  PrivateLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: !Ref Timeout
+      Subnets: !Split [',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'}]
+        # The load balancer is placed into the Private subnets, so that traffic
+        # from the internal can reach the load balancer directly via the Nat gateway
+      SecurityGroups: [!Ref 'PrivateLoadBalancerSG']
+  # A dummy target group is used to setup the ALB to just drop traffic
+  # initially, before any real service target groups have been added.
+  WebTargetGroupPrivate:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Port: !Ref Ports
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: 20
+      Matcher:
+        HttpCode: '200-499'
+      VpcId:
+        Fn::ImportValue: !Sub ${ParentVPCStack}-VPC
+  PrivateLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PrivateLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'WebTargetGroupPrivate'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PrivateLoadBalancer'
+      Port: 80 
+      Protocol: HTTP
+
+Outputs:
+  PublicListener:
+    Description: The ARN of the Private load balancer's Listener
+    Value: !Ref PrivateLoadBalancerListener
+    Export:
+      Name: !Sub ${EnvironmentName}:PrivateListener
+  ExternalUrl:
+    Description: The url of the internal load balancer
+    Value: !Sub http://${PrivateLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${EnvironmentName}:internalUrl
+
